@@ -5,6 +5,10 @@ import type {
   Paint,
   Vector,
   GetFileResponse,
+  Style,
+  Component,
+  StyleType,
+  ComponentSet,
 } from "@figma/rest-api-spec";
 import { hasValue, isRectangleCornerRadii, isTruthy } from "~/utils/identity.js";
 import { removeEmptyKeys, generateVarId, StyleId, parsePaint, isVisible } from "~/utils/common.js";
@@ -45,9 +49,22 @@ type StyleTypes =
   | SimplifiedStroke
   | SimplifiedEffects
   | string;
+
+type SimplifiedComponent = {
+  name: string;
+  properties: Record<string, string | boolean>;
+};
+
 type GlobalVars = {
   styles: Record<StyleId, StyleTypes>;
 };
+
+type ReferenceStyles = {
+  styles: Record<string, Style>;
+  components: Record<string, Component>;
+  componentSets: Record<string, ComponentSet>;
+};
+
 export interface SimplifiedDesign {
   name: string;
   lastModified: string;
@@ -67,7 +84,8 @@ export interface SimplifiedNode {
   textStyle?: string;
   // appearance
   fills?: string;
-  styles?: string;
+  styles?: { [key in StyleType]?: string };
+  component?: SimplifiedComponent;
   strokes?: string;
   effects?: string;
   opacity?: number;
@@ -115,17 +133,34 @@ export interface ColorValue {
 export function parseFigmaResponse(data: GetFileResponse | GetFileNodesResponse): SimplifiedDesign {
   const { name, lastModified, thumbnailUrl } = data;
   let nodes: FigmaDocumentNode[];
+  let globalVars: GlobalVars = {
+    styles: {},
+  };
+  const references: ReferenceStyles = {
+    componentSets: {},
+    components: {},
+    styles: {},
+  };
   if ("document" in data) {
     nodes = Object.values(data.document.children);
   } else {
     nodes = Object.values(data.nodes).map((n) => n.document);
+
+    Object.values(data.nodes).forEach((n) => {
+      Object.entries(n.styles).forEach(([id, style]) => {
+        references.styles[id] = style;
+      });
+      Object.entries(n.components).forEach(([id, component]) => {
+        references.components[id] = component;
+      });
+      Object.entries(n.componentSets).forEach(([id, componentSet]) => {
+        references.componentSets[id] = componentSet;
+      });
+    });
   }
-  let globalVars: GlobalVars = {
-    styles: {},
-  };
   const simplifiedNodes: SimplifiedNode[] = nodes
     .filter(isVisible)
-    .map((n) => parseNode(globalVars, n))
+    .map((n) => parseNode(globalVars, references, n))
     .filter((child) => child !== null && child !== undefined);
 
   return {
@@ -181,6 +216,7 @@ function findOrCreateVar(globalVars: GlobalVars, value: any, prefix: string): St
 
 function parseNode(
   globalVars: GlobalVars,
+  references: ReferenceStyles,
   n: FigmaDocumentNode,
   parent?: FigmaDocumentNode,
 ): SimplifiedNode | null {
@@ -191,6 +227,40 @@ function parseNode(
     name,
     type,
   };
+
+  if ("styles" in n && n.styles) {
+    Object.values(n.styles)
+      .map((styleName) => references.styles[styleName])
+      .filter(Boolean)
+      .forEach((style) => {
+        simplified.styles = {
+          ...simplified.styles,
+          [style.styleType]: style.name,
+        };
+      });
+  }
+
+  if ("componentId" in n && n.componentId) {
+    const component = references.components[n.componentId];
+    const componentSet = component.componentSetId
+      ? references.componentSets[component.componentSetId]
+      : undefined;
+
+    const componentName = componentSet?.name ?? component.name ?? name;
+
+    const properties: Record<string, string | boolean> = {};
+
+    if (n.componentProperties) {
+      Object.entries(n.componentProperties).forEach(([key, { value }]) => {
+        properties[key] = value;
+      });
+    }
+
+    simplified.component = {
+      name: componentName,
+      properties,
+    };
+  }
 
   // text
   if (hasValue("style", n) && Object.keys(n.style).length) {
@@ -260,7 +330,7 @@ function parseNode(
   if (hasValue("children", n) && n.children.length > 0) {
     let children = n.children
       .filter(isVisible)
-      .map((child) => parseNode(globalVars, child, n))
+      .map((child) => parseNode(globalVars, references, child, n))
       .filter((child) => child !== null && child !== undefined);
     if (children.length) {
       simplified.children = children;
